@@ -7,8 +7,8 @@
 #include <Preferences.h>
 
 // ===== WiFi info =====
-const char* ssid     = "Wokwi-GUEST";
-const char* password = "";
+const char* ssid     = "Red_Monster";
+const char* password = "kln711009095";
 
 // ===== OLED setup =====
 #define SCREEN_WIDTH 128
@@ -26,6 +26,17 @@ bool hasRealSht31 = false;
 #define LED_LAN 5
 #define WARN_LED_PIN 2
 #define BTN_TZ 7
+
+// ----- BATTERY SENSE (дільник 47k / 100k на GPIO1) -----
+#define BAT_ADC_PIN 1          // вузол між 47k і 100k
+
+const float R1_BAT = 47000.0;  // верхній резистор до батареї
+const float R2_BAT = 100000.0; // нижній резистор до GND
+const float ADC_REF_V   = 3.3;     // реф. напруга АЦП
+const float ADC_MAX_VAL = 4095.0;  // 12-бітний ADC
+
+const float VBAT_MIN = 3.0;   // 0%
+const float VBAT_MAX = 4.2;   // 100%
 
 // ===== LED / warning =====
 unsigned long lastBlink     = 0;
@@ -84,7 +95,7 @@ bool lastBtnState      = HIGH;
 unsigned long lastBtnChange = 0;
 
 // Інфо-текст згори
-uint8_t infoMode = 0;                  // 0=date,1=phase,2=TZ,3=OK
+uint8_t infoMode = 0;                  // 0=date,1=phase,2=TZ,3=status
 unsigned long lastInfoChange = 0;
 
 // Дні тижня (робот-стайл)
@@ -154,7 +165,6 @@ bool waitForTime(uint32_t timeoutMs, const char* loaderMsg) {
       if (!useMarquee) {
         return true;
       }
-      // якщо крутимо текст – даємо йому докрутитись один раз
     }
 
     if (useMarquee) {
@@ -211,7 +221,7 @@ void stopMarquee() {
   marqueeActive = false;
   marqueeText   = "";
   marqueeLoop   = true;
-  tzChangeMarqueeActive = false;  // якщо це було TZ-повідомлення, воно вже закінчилось
+  tzChangeMarqueeActive = false;
 }
 
 // ===== TZ =====
@@ -226,7 +236,8 @@ void handleTimezoneButton() {
   if (reading != lastBtnState && (millis() - lastBtnChange) > 200) {
     lastBtnChange = millis();
 
-    if (reading == LOW) {
+    // сенсорна кнопка → HIGH = дотик
+    if (reading == HIGH) {
       currentTzIndex++;
       int tzCount = sizeof(timezones) / sizeof(timezones[0]);
       if (currentTzIndex >= tzCount) currentTzIndex = 0;
@@ -237,7 +248,6 @@ void handleTimezoneButton() {
       Serial.print("Switched TZ to: ");
       Serial.println(timezones[currentTzIndex].shortName);
 
-      // якщо часу ще нема – спроба досинхронізувати з власним текстом
       if (!timeSynced) {
         timeSynced = waitForTime(
           5000,
@@ -245,7 +255,7 @@ void handleTimezoneButton() {
         );
       }
 
-      // зупиняємо possible ALERT intro, щоб TZ-повідомлення не блокувалось
+      // зупиняємо можливий ALERT intro
       warningIntroActive = false;
       warningIntroPhase  = 0;
 
@@ -258,7 +268,7 @@ void handleTimezoneButton() {
         timezones[currentTzIndex].shortName
       );
       tzChangeMarqueeActive = true;
-      startMarquee(msg, 5, false);   // один прохід
+      startMarquee(msg, 5, false);
     }
   }
 
@@ -278,6 +288,22 @@ String getPhaseString(int hours24) {
   } else {
     return "LOCAL PHASE: NIGHT WATCH CYCLE.";
   }
+}
+
+// ===== BATTERY helpers =====
+float readBatteryVoltage() {
+  int raw = analogRead(BAT_ADC_PIN);
+  float vAdc = (raw / ADC_MAX_VAL) * ADC_REF_V;
+  float vBat = vAdc * (R1_BAT + R2_BAT) / R2_BAT;  // масштабування дільника
+  return vBat;
+}
+
+int getBatteryPercent(float vBat) {
+  // лінійне перетворення 3.0–4.2 В → 0–100 %
+  float pct = (vBat - VBAT_MIN) / (VBAT_MAX - VBAT_MIN) * 100.0;
+  if (pct < 0) pct = 0;
+  if (pct > 100) pct = 100;
+  return (int)(pct + 0.5); // округлення
 }
 
 // ---------------- setup / loop ----------------
@@ -313,7 +339,7 @@ void setup() {
     for (;;);
   }
   display.clearDisplay();
-  display.setRotation(1);  // 128x32 → 32x128
+  display.setRotation(1);
   display.setTextWrap(false);
   display.display();
 
@@ -336,7 +362,8 @@ void setup() {
   pinMode(LED_PIN, OUTPUT);
   pinMode(LED_LAN, OUTPUT);
   pinMode(WARN_LED_PIN, OUTPUT);
-  pinMode(BTN_TZ, INPUT_PULLUP);
+  pinMode(BTN_TZ, INPUT);      // <--- ТАЧ-КНОПКА: простий INPUT
+  pinMode(BAT_ADC_PIN, INPUT);
 
   digitalWrite(LED_PIN, LOW);
   digitalWrite(LED_LAN, LOW);
@@ -363,9 +390,9 @@ void loop() {
     marqueeX--;
     if (marqueeX < -marqueeWidth) {
       if (marqueeLoop) {
-        marqueeX = display.width();   // нескінченний цикл
+        marqueeX = display.width();
       } else {
-        stopMarquee();                // один прохід → стоп
+        stopMarquee();
       }
     }
   }
@@ -400,6 +427,10 @@ void loop() {
     readFakeSht31(tempC, hum);
   }
 
+  // ===== Battery read =====
+  float vBat = readBatteryVoltage();
+  int   batPercent = getBatteryPercent(vBat);
+
   // ---- детальна діагностика WARNING ----
   bool tempTooLow  = (tempC < TEMP_MIN);
   bool tempTooHigh = (tempC > TEMP_MAX);
@@ -410,10 +441,9 @@ void loop() {
 
   // ===== Запуск / оновлення intro "ALERT" =====
   if (warning && !prevWarning) {
-    // новий warning, але не перебиваємо повідомлення про зміну TZ
     if (!tzChangeMarqueeActive) {
       warningIntroActive = true;
-      warningIntroPhase  = 1;           // старт з "ALERT" ON
+      warningIntroPhase  = 1;
       lastWarningIntroToggle = now;
     }
   }
@@ -428,7 +458,6 @@ void loop() {
       lastWarningIntroToggle = now;
       warningIntroPhase++;
       if (warningIntroPhase > 4) {
-        // ALERT показався двічі → завершуємо intro
         warningIntroActive = false;
         warningIntroPhase  = 0;
       }
@@ -460,12 +489,12 @@ void loop() {
     strcpy(sStr, "--");
   }
 
-  // ===== Вибір marquee (пріоритет: WARNING > !timeSynced > інфо) =====
+  // ===== Вибір marquee =====
   String desiredMarqueeStr = "";
-  bool   desiredLoop       = true;   // за замовчуванням крутити в циклі
+  bool   desiredLoop       = true;
 
   if (warning) {
-    // формуємо роботський текст з описом, що саме не так
+    // формуємо роботський текст
     String warnStr = "ERR CODE:";
     bool first = true;
 
@@ -493,13 +522,12 @@ void loop() {
     warnStr += " | ADJUST HABITAT CONDITIONS.";
 
     desiredMarqueeStr = warnStr;
-    desiredLoop       = true;        // попередження – безкінечно
+    desiredLoop       = true;
   } else if (!timeSynced) {
     desiredMarqueeStr =
       "TEMPORAL LINK LOST. RE-ACQUIRING PLANETARY TIME SIGNAL...";
     desiredLoop = true;
   } else if (infoMode == 0) {
-    // дата – один прохід
     char buf[48];
     const char* dow = WEEK_DAYS[constrain(dayOfWeek, 0, 6)];
     snprintf(buf, sizeof(buf),
@@ -508,30 +536,25 @@ void loop() {
     desiredMarqueeStr = String(buf);
     desiredLoop       = false;
   } else if (infoMode == 1) {
-    // Фаза доби – один прохід
     desiredMarqueeStr = getPhaseString(hours24);
     desiredLoop       = false;
   } else if (infoMode == 2) {
-    // TIMEZONE – один прохід
     desiredMarqueeStr =
       String("ACTIVE TIME GRID: SECTOR ") +
       timezones[currentTzIndex].shortName;
     desiredLoop = false;
   } else if (infoMode == 3) {
-    // статус – один прохід
-    desiredMarqueeStr =
-      "ALL SYSTEMS NOMINAL. CONTINUING HABITAT MONITORING.";
-    desiredLoop = false;
+    char buf[64];
+    snprintf(buf, sizeof(buf),
+             "ALL SYSTEMS NOMINAL. POWER LEVEL: %d%%.", batPercent);
+    desiredMarqueeStr = String(buf);
+    desiredLoop       = false;
   }
 
-  // логіка увімкнення marquee:
-  // - якщо warning → раніше ми перебивали все, але тепер НЕ перебиваємо
-  //   активне однопрохідне TZ-повідомлення
   if (desiredMarqueeStr.length() > 0) {
     if (!marqueeActive) {
       startMarquee(desiredMarqueeStr.c_str(), 5, desiredLoop);
     } else {
-      // якщо крутиться повідомлення про зміну TZ (one-shot) – не чіпаємо його
       if (tzChangeMarqueeActive && !marqueeLoop) {
         // даємо TZ-тексту доїхати
       } else {
@@ -543,7 +566,6 @@ void loop() {
       }
     }
   } else {
-    // немає бажаного тексту по логіці – зупиняємо тільки циклічні
     if (marqueeActive && marqueeLoop) {
       stopMarquee();
     }
@@ -556,9 +578,8 @@ void loop() {
 
   // Верхня зона
   if (warningIntroActive && !tzChangeMarqueeActive) {
-    // під час intro ми показуємо тільки мигаючий ALERT
     if (warningIntroPhase == 1 || warningIntroPhase == 3) {
-      display.setCursor(1, 5); // приблизно по центру 32px висоти
+      display.setCursor(1, 5);
       display.print("ALERT");
     }
   } else if (marqueeActive) {
@@ -568,7 +589,6 @@ void loop() {
     int x = 4;
     int y = 5;
     display.setCursor(x, y);
-
     if (!timeSynced) {
       display.print("TEMPORAL ERROR");
     }
@@ -588,10 +608,12 @@ void loop() {
   // Температура / вологість
   display.drawLine(0, 98, 128, 98, SSD1306_WHITE);
   display.setTextSize(1);
+
   display.setCursor(5, 105);
   display.print(int(tempC));
   display.print("C ");
   display.drawCircle(24, 105, 1, 1);
+
   display.setCursor(6, 118);
   display.print(int(hum));
   display.print("%");
